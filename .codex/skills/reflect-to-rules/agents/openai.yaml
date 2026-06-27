@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reflect to Rules"
+  short_description: "Turn work retrospectives into repo rules"
+  default_prompt: "Use $reflect-to-rules to review the recent work and update repository rules."

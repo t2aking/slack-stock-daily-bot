@@ -1,0 +1,4 @@
+interface:
+  display_name: "Slack Stock Bot Maintainer"
+  short_description: "Maintain this Slack stock market bot safely"
+  default_prompt: "Use $slack-stock-bot-maintainer to implement and verify a change in this Slack stock market bot."
