@@ -7,8 +7,11 @@ from io import StringIO
 
 SLACK_WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
 TARGET_SYMBOLS = ["^N225", "^GSPC", "VOO", "VTI", "QQQ", "USDJPY=X"]
+JAPAN_MARKET_SYMBOLS = ["^N225"]
 US_STOCK_SYMBOLS = ["^GSPC", "VOO", "VTI"]
 NASDAQ_SYMBOLS = ["QQQ"]
+US_MARKET_SYMBOLS = [*US_STOCK_SYMBOLS, *NASDAQ_SYMBOLS]
+FX_SYMBOLS = ["USDJPY=X"]
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,28 @@ def format_change(value: float) -> str:
 def format_change_rate(value: float) -> str:
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.2f}%"
+
+
+def quote_status_icon(quote: MarketQuote) -> str:
+    if quote.failed or quote.change is None or quote.change_rate is None:
+        return "⚠️"
+    if quote.change > 0:
+        return "🟢"
+    if quote.change < 0:
+        return "🔴"
+    return "⚪"
+
+
+def format_quote_line(quote: MarketQuote) -> str:
+    icon = quote_status_icon(quote)
+    if quote.failed or quote.close is None or quote.change is None or quote.change_rate is None:
+        return f"{icon} {quote.symbol}: 取得失敗"
+
+    return (
+        f"{icon} {quote.symbol}: 前日終値 {format_number(quote.close)} / "
+        f"前日比 {format_change(quote.change)} / "
+        f"前日比率 {format_change_rate(quote.change_rate)}"
+    )
 
 
 def find_quote(quotes: list[MarketQuote], symbol: str) -> MarketQuote | None:
@@ -153,26 +178,76 @@ def fetch_market_quotes(symbols: list[str] = TARGET_SYMBOLS) -> list[MarketQuote
     return [fetch_market_quote(symbol) for symbol in symbols]
 
 
+def quotes_for_symbols(quotes: list[MarketQuote], symbols: list[str]) -> list[MarketQuote]:
+    return [quote for symbol in symbols if (quote := find_quote(quotes, symbol)) is not None]
+
+
+def append_quote_section(lines: list[str], title: str, quotes: list[MarketQuote]) -> None:
+    lines.append(title)
+    if quotes:
+        lines.extend(format_quote_line(quote) for quote in quotes)
+    else:
+        lines.append("⚠️ 対象データがありません")
+
+
 def build_message(quotes: list[MarketQuote]) -> str:
     lines = ["株式市況"]
-    for quote in quotes:
-        if quote.failed or quote.close is None or quote.change is None or quote.change_rate is None:
-            lines.append(f"{quote.symbol}: 取得失敗")
-            continue
-
-        lines.append(
-            f"{quote.symbol}: 前日終値 {format_number(quote.close)} / "
-            f"前日比 {format_change(quote.change)} / "
-            f"前日比率 {format_change_rate(quote.change_rate)}"
-        )
+    sections = [
+        ("日本市場", quotes_for_symbols(quotes, JAPAN_MARKET_SYMBOLS)),
+        ("米国市場", quotes_for_symbols(quotes, US_MARKET_SYMBOLS)),
+        ("為替", quotes_for_symbols(quotes, FX_SYMBOLS)),
+    ]
+    for index, (title, section_quotes) in enumerate(sections):
+        if index > 0:
+            lines.append("")
+        append_quote_section(lines, title, section_quotes)
 
     lines.append("")
     lines.extend(generate_market_summary(quotes))
     return "\n".join(lines)
 
 
-def build_payload() -> dict[str, str]:
-    return {"text": build_message(fetch_market_quotes())}
+def build_blocks(quotes: list[MarketQuote]) -> list[dict[str, object]]:
+    blocks: list[dict[str, object]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": "株式市況", "emoji": True}}
+    ]
+    sections = [
+        ("日本市場", quotes_for_symbols(quotes, JAPAN_MARKET_SYMBOLS)),
+        ("米国市場", quotes_for_symbols(quotes, US_MARKET_SYMBOLS)),
+        ("為替", quotes_for_symbols(quotes, FX_SYMBOLS)),
+    ]
+    for title, section_quotes in sections:
+        text_lines = [f"*{title}*"]
+        if section_quotes:
+            text_lines.extend(format_quote_line(quote) for quote in section_quotes)
+        else:
+            text_lines.append("⚠️ 対象データがありません")
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n".join(text_lines)},
+            }
+        )
+
+    summary_lines = generate_market_summary(quotes)
+    blocks.extend(
+        [
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*{summary_lines[0]}*\n" + "\n".join(summary_lines[1:]),
+                },
+            },
+        ]
+    )
+    return blocks
+
+
+def build_payload() -> dict[str, object]:
+    quotes = fetch_market_quotes()
+    return {"text": build_message(quotes), "blocks": build_blocks(quotes)}
 
 
 def post_to_slack(webhook_url: str) -> None:
