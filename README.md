@@ -2,7 +2,7 @@
 
 Slackへ毎朝投稿する株式市況Botです。
 
-Issue #1では、Slack Incoming Webhookへ固定文をテスト投稿する最小構成を実装しています。
+Slack Incoming Webhookへ、yfinanceで取得した前日終値・前日比・前日比率を投稿します。
 
 ## セットアップ
 
@@ -42,7 +42,7 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 
 `.env` はgitの管理対象外です。
 
-## テスト投稿
+## 投稿
 
 ```bash
 python main.py
@@ -54,15 +54,20 @@ python main.py
 uv run python main.py
 ```
 
-成功すると、Slackに以下の固定文が投稿されます。
+成功すると、Slackに以下の形式で投稿されます。
 
 ```text
-株式市況Botのテスト投稿です。
+株式市況
+^N225: 前日終値 39,000.00 / 前日比 +100.00 / 前日比率 +0.26%
+VOO: 前日終値 500.00 / 前日比 -2.50 / 前日比率 -0.50%
 ```
+
+対象銘柄は `^N225`, `VOO`, `VTI`, `USDJPY=X` です。
+個別銘柄の取得に失敗した場合でも処理は止めず、該当行に `取得失敗` と表示します。
 
 ## エラー時
 
-`SLACK_WEBHOOK_URL` が未設定の場合やSlackへの投稿に失敗した場合は、標準エラーに原因がわかるメッセージを表示して終了します。
+`SLACK_WEBHOOK_URL` が未設定の場合、依存ライブラリが未インストールの場合、Slackへの投稿に失敗した場合は、標準エラーに原因がわかるメッセージを表示して終了します。
 
 ## 秘密情報の扱い
 

@@ -1,9 +1,21 @@
 import os
 import sys
+from dataclasses import dataclass
+from contextlib import redirect_stderr
+from io import StringIO
 
 
 SLACK_WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
-MESSAGE_TEXT = "株式市況Botのテスト投稿です。"
+TARGET_SYMBOLS = ["^N225", "VOO", "VTI", "USDJPY=X"]
+
+
+@dataclass(frozen=True)
+class MarketQuote:
+    symbol: str
+    close: float | None = None
+    change: float | None = None
+    change_rate: float | None = None
+    failed: bool = False
 
 
 def load_local_env() -> None:
@@ -17,8 +29,74 @@ def load_local_env() -> None:
     load_dotenv()
 
 
+def format_number(value: float) -> str:
+    return f"{value:,.2f}"
+
+
+def format_change(value: float) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:,.2f}"
+
+
+def format_change_rate(value: float) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}%"
+
+
+def fetch_market_quote(symbol: str) -> MarketQuote:
+    try:
+        import yfinance as yf
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "yfinance がインストールされていません。`uv pip install -r requirements.txt` または `pip install -r requirements.txt` を実行してください。"
+        ) from None
+
+    try:
+        with redirect_stderr(StringIO()):
+            history = yf.Ticker(symbol).history(period="10d", auto_adjust=False)
+        closes = history["Close"].dropna()
+        if len(closes) < 2:
+            return MarketQuote(symbol=symbol, failed=True)
+
+        previous_close = float(closes.iloc[-1])
+        before_previous_close = float(closes.iloc[-2])
+        if before_previous_close == 0:
+            return MarketQuote(symbol=symbol, failed=True)
+
+        change = previous_close - before_previous_close
+        change_rate = change / before_previous_close * 100
+        return MarketQuote(
+            symbol=symbol,
+            close=previous_close,
+            change=change,
+            change_rate=change_rate,
+        )
+    except Exception:
+        return MarketQuote(symbol=symbol, failed=True)
+
+
+def fetch_market_quotes(symbols: list[str] = TARGET_SYMBOLS) -> list[MarketQuote]:
+    return [fetch_market_quote(symbol) for symbol in symbols]
+
+
+def build_message(quotes: list[MarketQuote]) -> str:
+    lines = ["株式市況"]
+    for quote in quotes:
+        if quote.failed or quote.close is None or quote.change is None or quote.change_rate is None:
+            lines.append(f"{quote.symbol}: 取得失敗")
+            continue
+
+        lines.append(
+            f"{quote.symbol}: 前日終値 {format_number(quote.close)} / "
+            f"前日比 {format_change(quote.change)} / "
+            f"前日比率 {format_change_rate(quote.change_rate)}"
+        )
+
+    return "\n".join(lines)
+
+
 def build_payload() -> dict[str, str]:
-    return {"text": MESSAGE_TEXT}
+    return {"text": build_message(fetch_market_quotes())}
 
 
 def post_to_slack(webhook_url: str) -> None:
