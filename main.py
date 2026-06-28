@@ -1,26 +1,73 @@
 import os
 import sys
-from dataclasses import dataclass
 from contextlib import redirect_stderr
+from dataclasses import dataclass
 from io import StringIO
+from typing import Iterable
 
 
 SLACK_WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
-TARGET_SYMBOLS = ["^N225", "^GSPC", "VOO", "VTI", "QQQ", "USDJPY=X"]
-JAPAN_MARKET_SYMBOLS = ["^N225"]
-US_STOCK_SYMBOLS = ["^GSPC", "VOO", "VTI"]
-NASDAQ_SYMBOLS = ["QQQ"]
-US_MARKET_SYMBOLS = [*US_STOCK_SYMBOLS, *NASDAQ_SYMBOLS]
-FX_SYMBOLS = ["USDJPY=X"]
+STOCK_CONFIG_ENV = "STOCK_CONFIG_PATH"
+DEFAULT_STOCK_CONFIG_PATH = "stocks.yml"
+
+
+@dataclass(frozen=True)
+class MarketSymbol:
+    symbol: str
+    name: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        if not self.name or self.name == self.symbol:
+            return self.symbol
+
+        return f"{self.name} ({self.symbol})"
+
+
+@dataclass(frozen=True)
+class MarketConfig:
+    japan_indices: tuple[MarketSymbol, ...]
+    us_indices: tuple[MarketSymbol, ...]
+    fx: tuple[MarketSymbol, ...]
+
+    def all_symbols(self) -> tuple[MarketSymbol, ...]:
+        return (*self.japan_indices, *self.us_indices, *self.fx)
+
+    def sections(self) -> tuple[tuple[str, tuple[MarketSymbol, ...]], ...]:
+        return (
+            ("日本市場", self.japan_indices),
+            ("米国市場", self.us_indices),
+            ("為替", self.fx),
+        )
+
+
+DEFAULT_MARKET_CONFIG = MarketConfig(
+    japan_indices=(MarketSymbol(symbol="^N225", name="日経平均"),),
+    us_indices=(
+        MarketSymbol(symbol="^GSPC", name="S&P 500"),
+        MarketSymbol(symbol="VOO", name="VOO"),
+        MarketSymbol(symbol="VTI", name="VTI"),
+        MarketSymbol(symbol="QQQ", name="QQQ"),
+    ),
+    fx=(MarketSymbol(symbol="USDJPY=X", name="USD/JPY"),),
+)
 
 
 @dataclass(frozen=True)
 class MarketQuote:
     symbol: str
+    name: str | None = None
     close: float | None = None
     change: float | None = None
     change_rate: float | None = None
     failed: bool = False
+
+    @property
+    def display_name(self) -> str:
+        if not self.name or self.name == self.symbol:
+            return self.symbol
+
+        return f"{self.name} ({self.symbol})"
 
 
 def load_local_env() -> None:
@@ -32,6 +79,76 @@ def load_local_env() -> None:
         ) from None
 
     load_dotenv()
+
+
+def parse_market_symbol(item: object, path: str) -> MarketSymbol:
+    if not isinstance(item, dict):
+        raise RuntimeError(f"{path} は symbol/name を持つオブジェクトで指定してください。")
+
+    symbol = item.get("symbol")
+    name = item.get("name")
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise RuntimeError(f"{path}.symbol に空でない文字列を指定してください。")
+    if name is not None and not isinstance(name, str):
+        raise RuntimeError(f"{path}.name は文字列で指定してください。")
+
+    return MarketSymbol(symbol=symbol.strip(), name=name.strip() if isinstance(name, str) else None)
+
+
+def parse_market_symbol_list(data: object, path: str) -> tuple[MarketSymbol, ...]:
+    if data is None:
+        return ()
+    if not isinstance(data, list):
+        raise RuntimeError(f"{path} はリストで指定してください。")
+
+    return tuple(parse_market_symbol(item, f"{path}[{index}]") for index, item in enumerate(data))
+
+
+def parse_market_config(data: object) -> MarketConfig:
+    if not isinstance(data, dict):
+        raise RuntimeError("銘柄設定ファイルのトップレベルはオブジェクトで指定してください。")
+
+    indices = data.get("indices", {})
+    if indices is None:
+        indices = {}
+    if not isinstance(indices, dict):
+        raise RuntimeError("indices はオブジェクトで指定してください。")
+
+    config = MarketConfig(
+        japan_indices=parse_market_symbol_list(indices.get("japan"), "indices.japan"),
+        us_indices=parse_market_symbol_list(indices.get("us"), "indices.us"),
+        fx=parse_market_symbol_list(data.get("fx"), "fx"),
+    )
+    if not config.all_symbols():
+        raise RuntimeError("銘柄設定ファイルには少なくとも1件のsymbolを指定してください。")
+
+    return config
+
+
+def load_market_config(path: str | None = None) -> MarketConfig:
+    config_path = path or os.environ.get(STOCK_CONFIG_ENV, DEFAULT_STOCK_CONFIG_PATH)
+    if not os.path.exists(config_path):
+        if path is None and STOCK_CONFIG_ENV not in os.environ:
+            return DEFAULT_MARKET_CONFIG
+
+        raise RuntimeError(f"銘柄設定ファイルが見つかりません: {config_path}")
+
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "PyYAML がインストールされていません。`uv pip install -r requirements.txt` または `pip install -r requirements.txt` を実行してください。"
+        ) from None
+
+    try:
+        with open(config_path, encoding="utf-8") as file:
+            data = yaml.safe_load(file)
+    except OSError as exc:
+        raise RuntimeError(f"銘柄設定ファイルを読み込めませんでした: {config_path}: {exc}") from None
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"銘柄設定ファイルのYAML形式が不正です: {config_path}: {exc}") from None
+
+    return parse_market_config(data)
 
 
 def format_number(value: float) -> str:
@@ -61,10 +178,10 @@ def quote_status_icon(quote: MarketQuote) -> str:
 def format_quote_line(quote: MarketQuote) -> str:
     icon = quote_status_icon(quote)
     if quote.failed or quote.close is None or quote.change is None or quote.change_rate is None:
-        return f"{icon} {quote.symbol}: 取得失敗"
+        return f"{icon} {quote.display_name}: 取得失敗"
 
     return (
-        f"{icon} {quote.symbol}: 前日終値 {format_number(quote.close)} / "
+        f"{icon} {quote.display_name}: 前日終値 {format_number(quote.close)} / "
         f"前日比 {format_change(quote.change)} / "
         f"前日比率 {format_change_rate(quote.change_rate)}"
     )
@@ -90,24 +207,32 @@ def valid_change_rate(quote: MarketQuote | None) -> float | None:
     return quote.change_rate
 
 
-def generate_market_summary(quotes: list[MarketQuote]) -> list[str]:
+def is_nasdaq_symbol(symbol: MarketSymbol) -> bool:
+    return "NASDAQ" in (symbol.name or "").upper() or symbol.symbol.upper() == "QQQ"
+
+
+def generate_market_summary(
+    quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG
+) -> list[str]:
     us_stock_rates = [
         rate
-        for symbol in US_STOCK_SYMBOLS
-        if (rate := valid_change_rate(find_quote(quotes, symbol))) is not None
+        for symbol in config.us_indices
+        if not is_nasdaq_symbol(symbol)
+        if (rate := valid_change_rate(find_quote(quotes, symbol.symbol))) is not None
     ]
     nasdaq_rates = [
         rate
-        for symbol in NASDAQ_SYMBOLS
-        if (rate := valid_change_rate(find_quote(quotes, symbol))) is not None
+        for symbol in config.us_indices
+        if is_nasdaq_symbol(symbol)
+        if (rate := valid_change_rate(find_quote(quotes, symbol.symbol))) is not None
     ]
     usd_jpy = find_quote(quotes, "USDJPY=X")
 
     lines = ["値動きサマリ"]
     if us_stock_rates and any(rate > 0 for rate in us_stock_rates):
-        lines.append("- S&P500/VOO/VTIの値動きから、米国株は堅調です。")
+        lines.append("- 米国市場の値動きから、米国株は堅調です。")
     elif us_stock_rates:
-        lines.append("- S&P500/VOO/VTIの値動きから、米国株は上値の重い展開です。")
+        lines.append("- 米国市場の値動きから、米国株は上値の重い展開です。")
     else:
         lines.append("- 米国株の方向感は取得データ不足で判断を控えます。")
 
@@ -142,7 +267,7 @@ def generate_market_summary(quotes: list[MarketQuote]) -> list[str]:
     return lines
 
 
-def fetch_market_quote(symbol: str) -> MarketQuote:
+def fetch_market_quote(symbol: str, name: str | None = None) -> MarketQuote:
     try:
         import yfinance as yf
     except ModuleNotFoundError:
@@ -155,31 +280,33 @@ def fetch_market_quote(symbol: str) -> MarketQuote:
             history = yf.Ticker(symbol).history(period="10d", auto_adjust=False)
         closes = history["Close"].dropna()
         if len(closes) < 2:
-            return MarketQuote(symbol=symbol, failed=True)
+            return MarketQuote(symbol=symbol, name=name, failed=True)
 
         previous_close = float(closes.iloc[-1])
         before_previous_close = float(closes.iloc[-2])
         if before_previous_close == 0:
-            return MarketQuote(symbol=symbol, failed=True)
+            return MarketQuote(symbol=symbol, name=name, failed=True)
 
         change = previous_close - before_previous_close
         change_rate = change / before_previous_close * 100
         return MarketQuote(
             symbol=symbol,
+            name=name,
             close=previous_close,
             change=change,
             change_rate=change_rate,
         )
     except Exception:
-        return MarketQuote(symbol=symbol, failed=True)
+        return MarketQuote(symbol=symbol, name=name, failed=True)
 
 
-def fetch_market_quotes(symbols: list[str] = TARGET_SYMBOLS) -> list[MarketQuote]:
-    return [fetch_market_quote(symbol) for symbol in symbols]
+def fetch_market_quotes(symbols: Iterable[MarketSymbol] | None = None) -> list[MarketQuote]:
+    target_symbols = tuple(symbols or load_market_config().all_symbols())
+    return [fetch_market_quote(symbol.symbol, symbol.name) for symbol in target_symbols]
 
 
-def quotes_for_symbols(quotes: list[MarketQuote], symbols: list[str]) -> list[MarketQuote]:
-    return [quote for symbol in symbols if (quote := find_quote(quotes, symbol)) is not None]
+def quotes_for_symbols(quotes: list[MarketQuote], symbols: Iterable[MarketSymbol]) -> list[MarketQuote]:
+    return [quote for symbol in symbols if (quote := find_quote(quotes, symbol.symbol)) is not None]
 
 
 def append_quote_section(lines: list[str], title: str, quotes: list[MarketQuote]) -> None:
@@ -190,12 +317,10 @@ def append_quote_section(lines: list[str], title: str, quotes: list[MarketQuote]
         lines.append("⚠️ 対象データがありません")
 
 
-def build_message(quotes: list[MarketQuote]) -> str:
+def build_message(quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG) -> str:
     lines = ["株式市況"]
     sections = [
-        ("日本市場", quotes_for_symbols(quotes, JAPAN_MARKET_SYMBOLS)),
-        ("米国市場", quotes_for_symbols(quotes, US_MARKET_SYMBOLS)),
-        ("為替", quotes_for_symbols(quotes, FX_SYMBOLS)),
+        (title, quotes_for_symbols(quotes, symbols)) for title, symbols in config.sections()
     ]
     for index, (title, section_quotes) in enumerate(sections):
         if index > 0:
@@ -203,18 +328,18 @@ def build_message(quotes: list[MarketQuote]) -> str:
         append_quote_section(lines, title, section_quotes)
 
     lines.append("")
-    lines.extend(generate_market_summary(quotes))
+    lines.extend(generate_market_summary(quotes, config))
     return "\n".join(lines)
 
 
-def build_blocks(quotes: list[MarketQuote]) -> list[dict[str, object]]:
+def build_blocks(
+    quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG
+) -> list[dict[str, object]]:
     blocks: list[dict[str, object]] = [
         {"type": "header", "text": {"type": "plain_text", "text": "株式市況", "emoji": True}}
     ]
     sections = [
-        ("日本市場", quotes_for_symbols(quotes, JAPAN_MARKET_SYMBOLS)),
-        ("米国市場", quotes_for_symbols(quotes, US_MARKET_SYMBOLS)),
-        ("為替", quotes_for_symbols(quotes, FX_SYMBOLS)),
+        (title, quotes_for_symbols(quotes, symbols)) for title, symbols in config.sections()
     ]
     for title, section_quotes in sections:
         text_lines = [f"*{title}*"]
@@ -229,7 +354,7 @@ def build_blocks(quotes: list[MarketQuote]) -> list[dict[str, object]]:
             }
         )
 
-    summary_lines = generate_market_summary(quotes)
+    summary_lines = generate_market_summary(quotes, config)
     blocks.extend(
         [
             {"type": "divider"},
@@ -246,8 +371,9 @@ def build_blocks(quotes: list[MarketQuote]) -> list[dict[str, object]]:
 
 
 def build_payload() -> dict[str, object]:
-    quotes = fetch_market_quotes()
-    return {"text": build_message(quotes), "blocks": build_blocks(quotes)}
+    config = load_market_config()
+    quotes = fetch_market_quotes(config.all_symbols())
+    return {"text": build_message(quotes, config), "blocks": build_blocks(quotes, config)}
 
 
 def post_to_slack(webhook_url: str) -> None:
