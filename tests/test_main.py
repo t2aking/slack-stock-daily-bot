@@ -1,7 +1,17 @@
 import unittest
 from unittest.mock import patch
 
-from main import MarketQuote, build_blocks, build_message, build_payload, generate_market_summary
+from main import (
+    DEFAULT_MARKET_CONFIG,
+    MarketConfig,
+    MarketQuote,
+    MarketSymbol,
+    build_blocks,
+    build_message,
+    build_payload,
+    generate_market_summary,
+    parse_market_config,
+)
 
 
 class BuildMessageTest(unittest.TestCase):
@@ -65,7 +75,7 @@ class BuildMessageTest(unittest.TestCase):
                     "🟢 USDJPY=X: 前日終値 160.00 / 前日比 +0.80 / 前日比率 +0.50%",
                     "",
                     "値動きサマリ",
-                    "- S&P500/VOO/VTIの値動きから、米国株は堅調です。",
+                    "- 米国市場の値動きから、米国株は堅調です。",
                     "- NASDAQ系が相対的に強く、ハイテク優勢です。",
                     "- USDJPYは上昇しており、円安方向です。",
                     "- 日本株には外部環境と為替が追い風になりやすい市況です。",
@@ -100,7 +110,7 @@ class BuildMessageTest(unittest.TestCase):
                     "⚠️ USDJPY=X: 取得失敗",
                     "",
                     "値動きサマリ",
-                    "- S&P500/VOO/VTIの値動きから、米国株は上値の重い展開です。",
+                    "- 米国市場の値動きから、米国株は上値の重い展開です。",
                     "- NASDAQ系の方向感は取得データ不足で判断を控えます。",
                     "- 為替の方向感は取得データ不足で判断を控えます。",
                     "- 日本株には外部環境の支えが限られる市況です。",
@@ -133,10 +143,13 @@ class BuildMessageTest(unittest.TestCase):
     def test_build_payload_fetches_quotes_once_for_text_and_blocks(self) -> None:
         quotes = [MarketQuote(symbol="^N225", close=39000, change=100, change_rate=0.25641)]
 
-        with patch("main.fetch_market_quotes", return_value=quotes) as fetch_market_quotes:
+        with (
+            patch("main.load_market_config", return_value=DEFAULT_MARKET_CONFIG),
+            patch("main.fetch_market_quotes", return_value=quotes) as fetch_market_quotes,
+        ):
             payload = build_payload()
 
-        fetch_market_quotes.assert_called_once_with()
+        fetch_market_quotes.assert_called_once_with(DEFAULT_MARKET_CONFIG.all_symbols())
         self.assertIn("blocks", payload)
         self.assertIn("text", payload)
         self.assertIn("🟢 ^N225", payload["text"])
@@ -157,13 +170,52 @@ class BuildMessageTest(unittest.TestCase):
             summary,
             [
                 "値動きサマリ",
-                "- S&P500/VOO/VTIの値動きから、米国株は上値の重い展開です。",
+                "- 米国市場の値動きから、米国株は上値の重い展開です。",
                 "- NASDAQ系はやや弱く、ハイテク株には慎重な地合いです。",
                 "- USDJPYは低下しており、円高方向です。",
                 "- 日本株には外部環境の支えが限られる市況です。",
                 "- 投資助言ではなく、市況メモとしての整理です。",
             ],
         )
+
+    def test_builds_message_from_custom_config(self) -> None:
+        config = MarketConfig(
+            japan_indices=(
+                MarketSymbol(symbol="^N225", name="日経平均"),
+                MarketSymbol(symbol="^TOPX", name="TOPIX"),
+            ),
+            us_indices=(MarketSymbol(symbol="VOO", name="VOO"),),
+            fx=(MarketSymbol(symbol="USDJPY=X", name="USD/JPY"),),
+        )
+        message = build_message(
+            [
+                MarketQuote(symbol="^N225", name="日経平均", close=39000, change=100, change_rate=0.2),
+                MarketQuote(symbol="^TOPX", name="TOPIX", close=2800, change=-10, change_rate=-0.36),
+                MarketQuote(symbol="VOO", name="VOO", close=501, change=1, change_rate=0.2),
+                MarketQuote(symbol="USDJPY=X", name="USD/JPY", close=160, change=0.8, change_rate=0.5),
+            ],
+            config,
+        )
+
+        self.assertIn("🟢 日経平均 (^N225): 前日終値 39,000.00", message)
+        self.assertIn("🔴 TOPIX (^TOPX): 前日終値 2,800.00", message)
+        self.assertIn("🟢 VOO: 前日終値 501.00", message)
+        self.assertIn("🟢 USD/JPY (USDJPY=X): 前日終値 160.00", message)
+
+    def test_parses_market_config(self) -> None:
+        config = parse_market_config(
+            {
+                "indices": {
+                    "japan": [{"symbol": "^N225", "name": "日経平均"}],
+                    "us": [{"symbol": "VOO", "name": "VOO"}],
+                },
+                "fx": [{"symbol": "USDJPY=X", "name": "USD/JPY"}],
+            }
+        )
+
+        self.assertEqual(config.japan_indices[0], MarketSymbol(symbol="^N225", name="日経平均"))
+        self.assertEqual(config.us_indices[0], MarketSymbol(symbol="VOO", name="VOO"))
+        self.assertEqual(config.fx[0], MarketSymbol(symbol="USDJPY=X", name="USD/JPY"))
 
 
 if __name__ == "__main__":

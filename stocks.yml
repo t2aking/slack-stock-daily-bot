@@ -1,0 +1,18 @@
+indices:
+  japan:
+    - symbol: "^N225"
+      name: "日経平均"
+
+  us:
+    - symbol: "^GSPC"
+      name: "S&P 500"
+    - symbol: "VOO"
+      name: "VOO"
+    - symbol: "VTI"
+      name: "VTI"
+    - symbol: "QQQ"
+      name: "QQQ"
+
+fx:
+  - symbol: "USDJPY=X"
+    name: "USD/JPY"
