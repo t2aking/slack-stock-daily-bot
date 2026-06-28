@@ -114,6 +114,19 @@ uv run python main.py
 上昇は `🟢`、下落は `🔴`、横ばいは `⚪` で表示します。
 個別銘柄の取得に失敗した場合でも処理は止めず、該当行に `⚠️ 取得失敗` と表示します。
 
+## 自動実行
+
+GitHub Actionsで、火曜〜土曜の朝9時（JST）に自動投稿します。
+GitHub ActionsのcronはUTC基準のため、設定は `0 0 * * 2-6` です。
+
+リポジトリの `Settings` → `Secrets and variables` → `Actions` に、以下のRepository secretを登録してください。
+
+```text
+SLACK_WEBHOOK_URL
+```
+
+`.github/workflows/daily-stock.yml` は `workflow_dispatch` にも対応しているため、GitHub Actions画面から手動実行もできます。
+
 ## エラー時
 
 `SLACK_WEBHOOK_URL` が未設定の場合、銘柄設定ファイルが不正な場合、依存ライブラリが未インストールの場合、Slackへの投稿に失敗した場合は、標準エラーに原因がわかるメッセージを表示して終了します。
