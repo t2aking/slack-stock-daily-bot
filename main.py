@@ -4,17 +4,24 @@ import os
 import sys
 from contextlib import redirect_stderr
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from io import StringIO
 from typing import Iterable
 
 
 SLACK_WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
 STOCK_CONFIG_ENV = "STOCK_CONFIG_PATH"
+EVENT_CONFIG_ENV = "EVENT_CONFIG_PATH"
+EVENT_LOOKAHEAD_DAYS_ENV = "EVENT_LOOKAHEAD_DAYS"
+EVENT_LOOKBACK_DAYS_ENV = "EVENT_LOOKBACK_DAYS"
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 GEMINI_MODEL_ENV = "GEMINI_MODEL"
 GEMINI_FALLBACK_MODELS_ENV = "GEMINI_FALLBACK_MODELS"
 GEMINI_TIMEOUT_ENV = "GEMINI_TIMEOUT_SECONDS"
 DEFAULT_STOCK_CONFIG_PATH = "stocks.yml"
+DEFAULT_EVENT_CONFIG_PATH = "market_events.yml"
+DEFAULT_EVENT_LOOKAHEAD_DAYS = 7
+DEFAULT_EVENT_LOOKBACK_DAYS = 1
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite")
 DEFAULT_GEMINI_TIMEOUT_SECONDS = 45.0
@@ -78,6 +85,18 @@ class MarketQuote:
             return self.symbol
 
         return f"{self.name} ({self.symbol})"
+
+
+@dataclass(frozen=True)
+class MarketEvent:
+    date: date
+    title: str
+    category: str
+    region: str | None = None
+    note: str | None = None
+    end_date: date | None = None
+    importance: str | None = None
+    url: str | None = None
 
 
 def load_local_env() -> None:
@@ -161,6 +180,138 @@ def load_market_config(path: str | None = None) -> MarketConfig:
     return parse_market_config(data)
 
 
+def parse_date_value(value: object, path: str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{path} は YYYY-MM-DD 形式の日付で指定してください。")
+
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        raise RuntimeError(f"{path} は YYYY-MM-DD 形式の日付で指定してください。") from None
+
+
+def optional_string(value: object, path: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError(f"{path} は文字列で指定してください。")
+
+    stripped = value.strip()
+    return stripped or None
+
+
+def parse_market_event(item: object, path: str) -> MarketEvent:
+    if not isinstance(item, dict):
+        raise RuntimeError(f"{path} は event 情報を持つオブジェクトで指定してください。")
+
+    title = optional_string(item.get("title"), f"{path}.title")
+    category = optional_string(item.get("category"), f"{path}.category")
+    if title is None:
+        raise RuntimeError(f"{path}.title に空でない文字列を指定してください。")
+    if category is None:
+        raise RuntimeError(f"{path}.category に空でない文字列を指定してください。")
+
+    event_date = parse_date_value(item.get("date"), f"{path}.date")
+    end_date = None
+    if item.get("end_date") is not None:
+        end_date = parse_date_value(item.get("end_date"), f"{path}.end_date")
+        if end_date < event_date:
+            raise RuntimeError(f"{path}.end_date は {path}.date 以降の日付で指定してください。")
+
+    return MarketEvent(
+        date=event_date,
+        end_date=end_date,
+        title=title,
+        category=category,
+        region=optional_string(item.get("region"), f"{path}.region"),
+        importance=optional_string(item.get("importance"), f"{path}.importance"),
+        note=optional_string(item.get("note"), f"{path}.note"),
+        url=optional_string(item.get("url"), f"{path}.url"),
+    )
+
+
+def parse_market_events(data: object) -> tuple[MarketEvent, ...]:
+    if data is None:
+        return ()
+    if isinstance(data, dict):
+        data = data.get("events") or []
+    if not isinstance(data, list):
+        raise RuntimeError("イベント設定ファイルは events リスト、またはトップレベルのリストで指定してください。")
+
+    events = tuple(parse_market_event(item, f"events[{index}]") for index, item in enumerate(data))
+    return tuple(sorted(events, key=lambda event: (event.date, event.title)))
+
+
+def load_market_events(path: str | None = None) -> tuple[MarketEvent, ...]:
+    config_path = path or os.environ.get(EVENT_CONFIG_ENV, DEFAULT_EVENT_CONFIG_PATH)
+    if not os.path.exists(config_path):
+        if path is None and EVENT_CONFIG_ENV not in os.environ:
+            return ()
+
+        raise RuntimeError(f"イベント設定ファイルが見つかりません: {config_path}")
+
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "PyYAML がインストールされていません。`uv pip install -r requirements.txt` または `pip install -r requirements.txt` を実行してください。"
+        ) from None
+
+    try:
+        with open(config_path, encoding="utf-8") as file:
+            data = yaml.safe_load(file)
+    except OSError as exc:
+        raise RuntimeError(f"イベント設定ファイルを読み込めませんでした: {config_path}: {exc}") from None
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"イベント設定ファイルのYAML形式が不正です: {config_path}: {exc}") from None
+
+    return parse_market_events(data)
+
+
+def parse_non_negative_int(value: str | None, default: int) -> int:
+    if value is None or not value.strip():
+        return default
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+
+    return parsed if parsed >= 0 else default
+
+
+def filter_relevant_events(
+    events: Iterable[MarketEvent],
+    today: date | None = None,
+    lookback_days: int = DEFAULT_EVENT_LOOKBACK_DAYS,
+    lookahead_days: int = DEFAULT_EVENT_LOOKAHEAD_DAYS,
+) -> list[MarketEvent]:
+    base_date = today or date.today()
+    start_date = base_date - timedelta(days=lookback_days)
+    end_date = base_date + timedelta(days=lookahead_days)
+
+    relevant_events = [
+        event
+        for event in events
+        if event.date <= end_date and (event.end_date or event.date) >= start_date
+    ]
+    return sorted(relevant_events, key=lambda event: (event.date, event.title))
+
+
+def load_relevant_market_events(today: date | None = None) -> list[MarketEvent]:
+    lookback_days = parse_non_negative_int(
+        os.environ.get(EVENT_LOOKBACK_DAYS_ENV), DEFAULT_EVENT_LOOKBACK_DAYS
+    )
+    lookahead_days = parse_non_negative_int(
+        os.environ.get(EVENT_LOOKAHEAD_DAYS_ENV), DEFAULT_EVENT_LOOKAHEAD_DAYS
+    )
+    return filter_relevant_events(load_market_events(), today, lookback_days, lookahead_days)
+
+
 def format_number(value: float) -> str:
     return f"{value:,.2f}"
 
@@ -195,6 +346,30 @@ def format_quote_line(quote: MarketQuote) -> str:
         f"前日比 {format_change(quote.change)} / "
         f"前日比率 {format_change_rate(quote.change_rate)}"
     )
+
+
+def format_event_date(event: MarketEvent) -> str:
+    start = event.date.isoformat()
+    if event.end_date and event.end_date != event.date:
+        return f"{start}〜{event.end_date.isoformat()}"
+
+    return start
+
+
+def format_event_line(event: MarketEvent) -> str:
+    parts = [f"📅 {format_event_date(event)}", event.category, event.title]
+    if event.region:
+        parts.append(f"({event.region})")
+    if event.importance:
+        parts.append(f"[{event.importance}]")
+
+    line = " ".join(parts)
+    if event.note:
+        line += f" - {event.note}"
+    if event.url:
+        line += f" / 詳細: {event.url}"
+
+    return line
 
 
 def find_quote(quotes: list[MarketQuote], symbol: str) -> MarketQuote | None:
@@ -311,19 +486,34 @@ def build_market_data_for_ai(
     return "\n".join(lines)
 
 
+def build_event_data_for_ai(events: Iterable[MarketEvent]) -> str:
+    event_lines = [format_event_line(event) for event in events]
+    if not event_lines:
+        return "対象期間内の注目イベントはありません。"
+
+    return "\n".join(f"- {line}" for line in event_lines)
+
+
 def build_ai_summary_prompt(
-    quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG
+    quotes: list[MarketQuote],
+    config: MarketConfig = DEFAULT_MARKET_CONFIG,
+    events: Iterable[MarketEvent] | None = None,
 ) -> str:
     rule_summary = "\n".join(generate_market_summary(quotes, config)[1:])
     market_data = build_market_data_for_ai(quotes, config)
+    event_data = build_event_data_for_ai(events or [])
     return "\n".join(
         [
-            "以下の市場データをもとに、投資助言ではなく市況メモとして100〜150字で要約してください。",
+            "以下の市場データと注目イベントをもとに、投資助言ではなく市況メモとして100〜150字で要約してください。",
             "断定的な売買推奨は避けてください。",
-            "数値の分析メモを参考にしつつ、自然な日本語の1段落だけを返してください。",
+            "数値の分析メモを参考にしつつ、値動きの背景になりそうなイベントがあれば自然に触れてください。",
+            "自然な日本語の1段落だけを返してください。",
             "",
             "市場データ:",
             market_data,
+            "",
+            "注目イベント:",
+            event_data,
             "",
             "数値分析メモ:",
             rule_summary,
@@ -517,6 +707,7 @@ def generate_ai_market_summary(
     config: MarketConfig = DEFAULT_MARKET_CONFIG,
     api_key: str | None = None,
     model: str | None = None,
+    events: Iterable[MarketEvent] | None = None,
 ) -> str | None:
     gemini_api_key = (api_key if api_key is not None else os.environ.get(GEMINI_API_KEY_ENV, "")).strip()
     if not gemini_api_key:
@@ -529,7 +720,7 @@ def generate_ai_market_summary(
         os.environ.get(GEMINI_TIMEOUT_ENV), DEFAULT_GEMINI_TIMEOUT_SECONDS
     )
 
-    prompt = build_ai_summary_prompt(quotes, config)
+    prompt = build_ai_summary_prompt(quotes, config, events)
     failures: list[str] = []
     model_candidates = build_gemini_model_candidates(gemini_model)
     for index, candidate_model in enumerate(model_candidates):
@@ -629,10 +820,20 @@ def append_summary_lines(
         lines.extend(generate_market_summary(quotes, config))
 
 
+def append_event_lines(lines: list[str], events: Iterable[MarketEvent]) -> None:
+    event_list = list(events)
+    if not event_list:
+        return
+
+    lines.append("注目イベント")
+    lines.extend(format_event_line(event) for event in event_list)
+
+
 def build_message(
     quotes: list[MarketQuote],
     config: MarketConfig = DEFAULT_MARKET_CONFIG,
     ai_summary: str | None = None,
+    events: Iterable[MarketEvent] | None = None,
 ) -> str:
     lines = ["株式市況"]
     alert_lines = build_alert_lines(quotes, config)
@@ -648,6 +849,11 @@ def build_message(
             lines.append("")
         append_quote_section(lines, title, section_quotes)
 
+    event_list = list(events or [])
+    if event_list:
+        lines.append("")
+        append_event_lines(lines, event_list)
+
     lines.append("")
     append_summary_lines(lines, quotes, config, ai_summary)
     return "\n".join(lines)
@@ -657,6 +863,7 @@ def build_blocks(
     quotes: list[MarketQuote],
     config: MarketConfig = DEFAULT_MARKET_CONFIG,
     ai_summary: str | None = None,
+    events: Iterable[MarketEvent] | None = None,
 ) -> list[dict[str, object]]:
     alert_lines = build_alert_lines(quotes, config)
     blocks: list[dict[str, object]] = [
@@ -693,6 +900,18 @@ def build_blocks(
             }
         )
 
+    event_list = list(events or [])
+    if event_list:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*注目イベント*\n" + "\n".join(format_event_line(event) for event in event_list),
+                },
+            }
+        )
+
     summary_lines = (
         ["値動きサマリ", ai_summary] if ai_summary else generate_market_summary(quotes, config)
     )
@@ -713,11 +932,12 @@ def build_blocks(
 
 def build_payload() -> dict[str, object]:
     config = load_market_config()
+    events = load_relevant_market_events()
     quotes = fetch_market_quotes(config.all_symbols())
-    ai_summary = generate_ai_market_summary(quotes, config)
+    ai_summary = generate_ai_market_summary(quotes, config, events=events)
     return {
-        "text": build_message(quotes, config, ai_summary),
-        "blocks": build_blocks(quotes, config, ai_summary),
+        "text": build_message(quotes, config, ai_summary=ai_summary, events=events),
+        "blocks": build_blocks(quotes, config, ai_summary=ai_summary, events=events),
     }
 
 

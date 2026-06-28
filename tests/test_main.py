@@ -1,24 +1,32 @@
 import unittest
+from datetime import date
 from unittest.mock import Mock, patch
 
 from main import (
     DEFAULT_MARKET_CONFIG,
     MarketConfig,
+    MarketEvent,
     MarketQuote,
     MarketSymbol,
     build_gemini_model_candidates,
     build_blocks,
+    build_event_data_for_ai,
+    build_ai_summary_prompt,
     build_market_data_for_ai,
     build_message,
     build_payload,
     extract_gemini_output_text,
     extract_text_from_gemini_node,
     fetch_market_quote,
+    filter_relevant_events,
     format_exception_summary,
+    format_event_line,
     generate_ai_market_summary,
     generate_market_summary,
+    parse_market_events,
     parse_market_config,
     parse_model_list,
+    parse_non_negative_int,
     parse_positive_float,
     request_ai_market_summary,
     should_try_next_gemini_model,
@@ -154,20 +162,23 @@ class BuildMessageTest(unittest.TestCase):
 
     def test_build_payload_fetches_quotes_once_for_text_and_blocks(self) -> None:
         quotes = [MarketQuote(symbol="^N225", close=39000, change=100, change_rate=0.25641)]
+        events = [MarketEvent(date=date(2026, 7, 29), category="FOMC", title="FOMC政策金利発表", region="米国")]
 
         with (
             patch("main.load_market_config", return_value=DEFAULT_MARKET_CONFIG),
+            patch("main.load_relevant_market_events", return_value=events),
             patch("main.fetch_market_quotes", return_value=quotes) as fetch_market_quotes,
             patch("main.generate_ai_market_summary", return_value=None) as generate_ai_market_summary,
         ):
             payload = build_payload()
 
         fetch_market_quotes.assert_called_once_with(DEFAULT_MARKET_CONFIG.all_symbols())
-        generate_ai_market_summary.assert_called_once_with(quotes, DEFAULT_MARKET_CONFIG)
+        generate_ai_market_summary.assert_called_once_with(quotes, DEFAULT_MARKET_CONFIG, events=events)
         self.assertIn("blocks", payload)
         self.assertIn("text", payload)
         self.assertIn("🟢 ^N225", payload["text"])
         self.assertIn("🟢 ^N225", payload["blocks"][1]["text"]["text"])
+        self.assertIn("FOMC政策金利発表", payload["text"])
 
     def test_builds_message_with_ai_summary(self) -> None:
         quotes = [MarketQuote(symbol="^N225", close=39000, change=100, change_rate=0.25641)]
@@ -185,6 +196,7 @@ class BuildMessageTest(unittest.TestCase):
 
         with (
             patch("main.load_market_config", return_value=DEFAULT_MARKET_CONFIG),
+            patch("main.load_relevant_market_events", return_value=[]),
             patch("main.fetch_market_quotes", return_value=quotes),
             patch("main.generate_ai_market_summary", return_value="自然な市況メモです。"),
         ):
@@ -269,6 +281,32 @@ class BuildMessageTest(unittest.TestCase):
         self.assertIn("🟢 VOO: 前日終値 501.00", message)
         self.assertIn("🟢 USD/JPY (USDJPY=X): 前日終値 160.00", message)
 
+    def test_builds_message_with_market_events(self) -> None:
+        events = [
+            MarketEvent(
+                date=date(2026, 7, 29),
+                end_date=date(2026, 7, 30),
+                category="FOMC",
+                title="FOMC政策金利発表",
+                region="米国",
+                importance="高",
+                note="政策金利と声明文に注目",
+            )
+        ]
+
+        message = build_message(
+            [MarketQuote(symbol="^N225", close=39000, change=100, change_rate=0.2)],
+            events=events,
+        )
+        blocks = build_blocks(
+            [MarketQuote(symbol="^N225", close=39000, change=100, change_rate=0.2)],
+            events=events,
+        )
+
+        expected_line = "📅 2026-07-29〜2026-07-30 FOMC FOMC政策金利発表 (米国) [高] - 政策金利と声明文に注目"
+        self.assertIn("注目イベント\n" + expected_line, message)
+        self.assertIn("*注目イベント*\n" + expected_line, blocks[4]["text"]["text"])
+
     def test_parses_market_config(self) -> None:
         config = parse_market_config(
             {
@@ -283,6 +321,90 @@ class BuildMessageTest(unittest.TestCase):
         self.assertEqual(config.japan_indices[0], MarketSymbol(symbol="^N225", name="日経平均"))
         self.assertEqual(config.us_indices[0], MarketSymbol(symbol="VOO", name="VOO"))
         self.assertEqual(config.fx[0], MarketSymbol(symbol="USDJPY=X", name="USD/JPY"))
+
+    def test_parses_market_events(self) -> None:
+        events = parse_market_events(
+            {
+                "events": [
+                    {
+                        "date": "2026-07-29",
+                        "end_date": "2026-07-30",
+                        "category": "FOMC",
+                        "title": "FOMC政策金利発表",
+                        "region": "米国",
+                        "importance": "高",
+                        "note": "政策金利と声明文に注目",
+                        "url": "https://example.com/fomc",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            events[0],
+            MarketEvent(
+                date=date(2026, 7, 29),
+                end_date=date(2026, 7, 30),
+                category="FOMC",
+                title="FOMC政策金利発表",
+                region="米国",
+                importance="高",
+                note="政策金利と声明文に注目",
+                url="https://example.com/fomc",
+            ),
+        )
+
+    def test_filters_relevant_market_events(self) -> None:
+        events = [
+            MarketEvent(date=date(2026, 6, 25), category="古い", title="対象外"),
+            MarketEvent(date=date(2026, 6, 27), category="CPI", title="米CPI"),
+            MarketEvent(date=date(2026, 7, 4), category="雇用統計", title="米雇用統計"),
+            MarketEvent(date=date(2026, 7, 10), category="遠い", title="対象外"),
+        ]
+
+        relevant_events = filter_relevant_events(
+            events,
+            today=date(2026, 6, 28),
+            lookback_days=1,
+            lookahead_days=7,
+        )
+
+        self.assertEqual([event.title for event in relevant_events], ["米CPI", "米雇用統計"])
+
+    def test_formats_event_line_without_optional_fields(self) -> None:
+        self.assertEqual(
+            format_event_line(MarketEvent(date=date(2026, 7, 3), category="雇用統計", title="米雇用統計")),
+            "📅 2026-07-03 雇用統計 米雇用統計",
+        )
+
+    def test_formats_event_line_with_url(self) -> None:
+        self.assertEqual(
+            format_event_line(
+                MarketEvent(
+                    date=date(2026, 7, 29),
+                    category="FOMC",
+                    title="FOMC政策金利発表",
+                    url="https://example.com/fomc",
+                )
+            ),
+            "📅 2026-07-29 FOMC FOMC政策金利発表 / 詳細: https://example.com/fomc",
+        )
+
+    def test_builds_event_data_for_ai(self) -> None:
+        data = build_event_data_for_ai(
+            [MarketEvent(date=date(2026, 7, 3), category="雇用統計", title="米雇用統計", region="米国")]
+        )
+
+        self.assertIn("米雇用統計", data)
+
+    def test_build_ai_summary_prompt_includes_events(self) -> None:
+        prompt = build_ai_summary_prompt(
+            [],
+            events=[MarketEvent(date=date(2026, 7, 3), category="雇用統計", title="米雇用統計")],
+        )
+
+        self.assertIn("注目イベント:", prompt)
+        self.assertIn("米雇用統計", prompt)
 
     def test_builds_market_data_for_ai(self) -> None:
         data = build_market_data_for_ai(
@@ -491,6 +613,14 @@ class BuildMessageTest(unittest.TestCase):
         self.assertEqual(parse_positive_float("invalid", 45), 45)
         self.assertEqual(parse_positive_float("0", 45), 45)
         self.assertEqual(parse_positive_float("60", 45), 60)
+
+    def test_parse_non_negative_int_returns_default_for_invalid_values(self) -> None:
+        self.assertEqual(parse_non_negative_int(None, 7), 7)
+        self.assertEqual(parse_non_negative_int("", 7), 7)
+        self.assertEqual(parse_non_negative_int("invalid", 7), 7)
+        self.assertEqual(parse_non_negative_int("-1", 7), 7)
+        self.assertEqual(parse_non_negative_int("0", 7), 0)
+        self.assertEqual(parse_non_negative_int("14", 7), 14)
 
     def test_parse_model_list(self) -> None:
         self.assertEqual(parse_model_list(None), ())
