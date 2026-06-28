@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from contextlib import redirect_stderr
@@ -200,6 +201,16 @@ def quote_is_up(quote: MarketQuote | None) -> bool:
     )
 
 
+def quote_is_success(quote: MarketQuote | None) -> bool:
+    return (
+        quote is not None
+        and not quote.failed
+        and quote.close is not None
+        and quote.change is not None
+        and quote.change_rate is not None
+    )
+
+
 def valid_change_rate(quote: MarketQuote | None) -> float | None:
     if quote is None or quote.failed or quote.change_rate is None:
         return None
@@ -297,6 +308,7 @@ def fetch_market_quote(symbol: str, name: str | None = None) -> MarketQuote:
             change_rate=change_rate,
         )
     except Exception:
+        logging.exception("株価取得に失敗しました: %s", symbol)
         return MarketQuote(symbol=symbol, name=name, failed=True)
 
 
@@ -317,8 +329,27 @@ def append_quote_section(lines: list[str], title: str, quotes: list[MarketQuote]
         lines.append("⚠️ 対象データがありません")
 
 
+def all_quotes_failed(quotes: list[MarketQuote], config: MarketConfig) -> bool:
+    return all(not quote_is_success(find_quote(quotes, symbol.symbol)) for symbol in config.all_symbols())
+
+
+def build_alert_lines(quotes: list[MarketQuote], config: MarketConfig) -> list[str]:
+    if not all_quotes_failed(quotes, config):
+        return []
+
+    return [
+        "⚠️ 全銘柄の株価取得に失敗しました。",
+        "yfinanceまたはネットワークの状態を確認してください。",
+    ]
+
+
 def build_message(quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG) -> str:
     lines = ["株式市況"]
+    alert_lines = build_alert_lines(quotes, config)
+    if alert_lines:
+        lines.extend(alert_lines)
+        lines.append("")
+
     sections = [
         (title, quotes_for_symbols(quotes, symbols)) for title, symbols in config.sections()
     ]
@@ -335,9 +366,25 @@ def build_message(quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARK
 def build_blocks(
     quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG
 ) -> list[dict[str, object]]:
+    alert_lines = build_alert_lines(quotes, config)
     blocks: list[dict[str, object]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": "株式市況", "emoji": True}}
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "株式市況取得エラー" if alert_lines else "株式市況",
+                "emoji": True,
+            },
+        }
     ]
+    if alert_lines:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n".join(alert_lines)},
+            }
+        )
+
     sections = [
         (title, quotes_for_symbols(quotes, symbols)) for title, symbols in config.sections()
     ]
