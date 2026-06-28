@@ -73,12 +73,53 @@ STOCK_CONFIG_PATH=stocks.yml
 
 `symbol` は yfinance で取得できるティッカー、`name` はSlack表示用の名称です。`name` と `symbol` が異なる場合は `日経平均 (^N225)` のように表示されます。
 
+## 注目イベントの設定
+
+市況の背景になりやすいイベントは `market_events.yml` で設定します。
+初期状態では実イベントを投稿しないよう、コメント例だけを置いています。FOMC、CPI、雇用統計、日銀会合、米国主要決算など、運用で追いたい予定を公式日程に合わせて追加してください。
+
+```yaml
+events:
+  - date: "2026-07-29"
+    end_date: "2026-07-30"
+    category: "FOMC"
+    title: "FOMC政策金利発表"
+    region: "米国"
+    importance: "高"
+    note: "政策金利、声明文、記者会見に注目"
+    url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+
+  - date: "2026-07-03"
+    category: "雇用統計"
+    title: "米雇用統計"
+    region: "米国"
+    importance: "高"
+```
+
+別の設定ファイルを使う場合は `EVENT_CONFIG_PATH` を指定してください。
+
+```env
+EVENT_CONFIG_PATH=market_events.yml
+```
+
+投稿対象は標準で「前日から7日後まで」のイベントです。範囲を変える場合は `EVENT_LOOKBACK_DAYS` と `EVENT_LOOKAHEAD_DAYS` を指定します。
+
+```env
+EVENT_LOOKBACK_DAYS=1
+EVENT_LOOKAHEAD_DAYS=7
+```
+
+対象期間内のイベントがある場合はSlack投稿に `注目イベント` セクションを追加し、AI要約を使う場合はイベント情報もプロンプトに渡します。
+
 ## AI要約の設定
 
 `GEMINI_API_KEY` を設定すると、値動きサマリをGemini APIで100〜150字程度の自然な市況メモに整形します。
 数値分析はBot内のルールベース処理で行い、AIには文章化だけを任せます。
 
 ```env
+EVENT_CONFIG_PATH=market_events.yml
+EVENT_LOOKBACK_DAYS=1
+EVENT_LOOKAHEAD_DAYS=7
 GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-3.5-flash
 GEMINI_FALLBACK_MODELS=gemini-3.1-flash-lite,gemini-2.5-flash-lite
@@ -119,6 +160,9 @@ uv run python main.py
 為替
 🟢 USD/JPY (USDJPY=X): 前日終値 160.00 / 前日比 +0.80 / 前日比率 +0.50%
 
+注目イベント
+📅 2026-07-29〜2026-07-30 FOMC FOMC政策金利発表 (米国) [高] - 政策金利、声明文、記者会見に注目
+
 値動きサマリ
 - 米国市場の値動きから、米国株は堅調です。
 - NASDAQ系が相対的に強く、ハイテク優勢です。
@@ -156,6 +200,7 @@ GEMINI_API_KEY
 `GEMINI_MODEL` が未設定の場合は `gemini-3.5-flash` を使います。
 混雑時の退避先を変える場合はRepository variable `GEMINI_FALLBACK_MODELS` にカンマ区切りで指定してください。
 Gemini APIのタイムアウトを変える場合はRepository variable `GEMINI_TIMEOUT_SECONDS` を指定してください。
+イベント設定を変える場合はRepository variable `EVENT_LOOKBACK_DAYS` と `EVENT_LOOKAHEAD_DAYS` で投稿対象期間を調整できます。
 
 workflowは最小権限として `permissions: contents: read` を指定しています。
 GitHub側ではActionsのWorkflow permissionsをRead onlyにし、fork pull request workflowは外部コントリビューターの承認を必須にしてください。

@@ -36,4 +36,7 @@ jobs:
           GEMINI_FALLBACK_MODELS: ${{ vars.GEMINI_FALLBACK_MODELS }}
           GEMINI_TIMEOUT_SECONDS: ${{ vars.GEMINI_TIMEOUT_SECONDS }}
           STOCK_CONFIG_PATH: stocks.yml
+          EVENT_CONFIG_PATH: market_events.yml
+          EVENT_LOOKBACK_DAYS: ${{ vars.EVENT_LOOKBACK_DAYS }}
+          EVENT_LOOKAHEAD_DAYS: ${{ vars.EVENT_LOOKAHEAD_DAYS }}
         run: python main.py

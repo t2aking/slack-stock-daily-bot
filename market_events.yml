@@ -1,0 +1,24 @@
+events:
+  # Official calendars and company IR pages change over time.
+  # Keep dates updated before enabling events in production.
+  #
+  # - date: "2026-07-29"
+  #   end_date: "2026-07-30"
+  #   category: "FOMC"
+  #   title: "FOMC政策金利発表"
+  #   region: "米国"
+  #   importance: "高"
+  #   note: "政策金利、声明文、記者会見に注目"
+  #   url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+  #
+  # - date: "2026-07-03"
+  #   category: "雇用統計"
+  #   title: "米雇用統計"
+  #   region: "米国"
+  #   importance: "高"
+  #
+  # - date: "2026-07-30"
+  #   category: "主要決算"
+  #   title: "米国主要企業決算"
+  #   region: "米国"
+  #   note: "対象企業は運用に合わせて更新"
