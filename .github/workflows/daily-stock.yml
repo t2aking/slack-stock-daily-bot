@@ -6,10 +6,14 @@ on:
     - cron: "0 0 * * 2-6"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   post:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: stock-post
 
     steps:
       - name: Checkout
@@ -27,5 +31,9 @@ jobs:
       - name: Post market summary to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_FALLBACK_MODELS: ${{ vars.GEMINI_FALLBACK_MODELS }}
+          GEMINI_TIMEOUT_SECONDS: ${{ vars.GEMINI_TIMEOUT_SECONDS }}
           STOCK_CONFIG_PATH: stocks.yml
         run: python main.py

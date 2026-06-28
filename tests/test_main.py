@@ -6,12 +6,23 @@ from main import (
     MarketConfig,
     MarketQuote,
     MarketSymbol,
+    build_gemini_model_candidates,
     build_blocks,
+    build_market_data_for_ai,
     build_message,
     build_payload,
+    extract_gemini_output_text,
+    extract_text_from_gemini_node,
     fetch_market_quote,
+    format_exception_summary,
+    generate_ai_market_summary,
     generate_market_summary,
     parse_market_config,
+    parse_model_list,
+    parse_positive_float,
+    request_ai_market_summary,
+    should_try_next_gemini_model,
+    summarize_response_data,
 )
 
 
@@ -147,14 +158,40 @@ class BuildMessageTest(unittest.TestCase):
         with (
             patch("main.load_market_config", return_value=DEFAULT_MARKET_CONFIG),
             patch("main.fetch_market_quotes", return_value=quotes) as fetch_market_quotes,
+            patch("main.generate_ai_market_summary", return_value=None) as generate_ai_market_summary,
         ):
             payload = build_payload()
 
         fetch_market_quotes.assert_called_once_with(DEFAULT_MARKET_CONFIG.all_symbols())
+        generate_ai_market_summary.assert_called_once_with(quotes, DEFAULT_MARKET_CONFIG)
         self.assertIn("blocks", payload)
         self.assertIn("text", payload)
         self.assertIn("🟢 ^N225", payload["text"])
         self.assertIn("🟢 ^N225", payload["blocks"][1]["text"]["text"])
+
+    def test_builds_message_with_ai_summary(self) -> None:
+        quotes = [MarketQuote(symbol="^N225", close=39000, change=100, change_rate=0.25641)]
+        ai_summary = "米国株と為替の動きを踏まえると、日本株は外部環境を確認しながら底堅さを探る展開です。"
+
+        message = build_message(quotes, ai_summary=ai_summary)
+        blocks = build_blocks(quotes, ai_summary=ai_summary)
+
+        self.assertIn("値動きサマリ\n" + ai_summary, message)
+        self.assertNotIn("- 投資助言ではなく", message)
+        self.assertIn(ai_summary, blocks[5]["text"]["text"])
+
+    def test_build_payload_uses_ai_summary_when_available(self) -> None:
+        quotes = [MarketQuote(symbol="^N225", close=39000, change=100, change_rate=0.25641)]
+
+        with (
+            patch("main.load_market_config", return_value=DEFAULT_MARKET_CONFIG),
+            patch("main.fetch_market_quotes", return_value=quotes),
+            patch("main.generate_ai_market_summary", return_value="自然な市況メモです。"),
+        ):
+            payload = build_payload()
+
+        self.assertIn("自然な市況メモです。", payload["text"])
+        self.assertIn("自然な市況メモです。", payload["blocks"][5]["text"]["text"])
 
     def test_builds_all_failed_alert_payload(self) -> None:
         quotes = [
@@ -246,6 +283,238 @@ class BuildMessageTest(unittest.TestCase):
         self.assertEqual(config.japan_indices[0], MarketSymbol(symbol="^N225", name="日経平均"))
         self.assertEqual(config.us_indices[0], MarketSymbol(symbol="VOO", name="VOO"))
         self.assertEqual(config.fx[0], MarketSymbol(symbol="USDJPY=X", name="USD/JPY"))
+
+    def test_builds_market_data_for_ai(self) -> None:
+        data = build_market_data_for_ai(
+            [
+                MarketQuote(symbol="^N225", name="日経平均", close=39000, change=100, change_rate=0.26),
+                MarketQuote(symbol="^GSPC", name="S&P 500", failed=True),
+            ]
+        )
+
+        self.assertIn("日本市場", data)
+        self.assertIn("日経平均 (^N225): 前日終値 39,000.00, 前日比 +100.00, 前日比率 +0.26%", data)
+        self.assertIn("S&P 500 (^GSPC): 取得失敗", data)
+
+    def test_extracts_gemini_output_text_from_response(self) -> None:
+        self.assertEqual(
+            extract_gemini_output_text(
+                {
+                    "output_text": "自然な市況メモ",
+                }
+            ),
+            "自然な市況メモ",
+        )
+
+    def test_extracts_gemini_output_text_from_candidates_response(self) -> None:
+        self.assertEqual(
+            extract_gemini_output_text(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"text": "自然な"},
+                                    {"text": "市況メモ"},
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ),
+            "自然な市況メモ",
+        )
+
+    def test_extracts_gemini_output_text_from_interactions_steps_response(self) -> None:
+        self.assertEqual(
+            extract_gemini_output_text(
+                {
+                    "status": "completed",
+                    "steps": [
+                        {
+                            "response": {
+                                "output_text": "米国株は堅調で、為替も円安方向です。"
+                            }
+                        }
+                    ],
+                }
+            ),
+            "米国株は堅調で、為替も円安方向です。",
+        )
+
+    def test_extracts_nested_text_from_gemini_node(self) -> None:
+        self.assertEqual(
+            extract_text_from_gemini_node(
+                [
+                    {
+                        "output": [
+                            {
+                                "content": {
+                                    "parts": [
+                                        {"text": "自然な"},
+                                        {"text": "市況メモ"},
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ]
+            ),
+            "自然な市況メモ",
+        )
+
+    def test_summarizes_empty_gemini_response_data(self) -> None:
+        self.assertEqual(
+            summarize_response_data({"candidates": []}),
+            'レスポンスキー: candidates. レスポンス抜粋: {"candidates":[]}',
+        )
+
+    def test_request_ai_market_summary_reports_empty_response_shape(self) -> None:
+        response = Mock()
+        response.json.return_value = {"candidates": []}
+        requests = Mock()
+        requests.post.return_value = response
+
+        with patch.dict("sys.modules", {"requests": requests}):
+            with self.assertRaisesRegex(RuntimeError, "レスポンスキー: candidates"):
+                request_ai_market_summary("prompt", "test-api-key", "test-model")
+
+    def test_request_ai_market_summary_posts_to_gemini_api(self) -> None:
+        response = Mock()
+        response.json.return_value = {"output_text": "自然な市況メモです。"}
+        requests = Mock()
+        requests.post.return_value = response
+
+        with patch.dict("sys.modules", {"requests": requests}):
+            summary = request_ai_market_summary("prompt", "test-api-key", "test-model")
+
+        self.assertEqual(summary, "自然な市況メモです。")
+        requests.post.assert_called_once()
+        _, kwargs = requests.post.call_args
+        self.assertEqual(kwargs["headers"]["x-goog-api-key"], "test-api-key")
+        self.assertEqual(kwargs["json"]["model"], "test-model")
+        self.assertEqual(kwargs["json"]["input"], "prompt")
+        self.assertEqual(kwargs["json"]["generation_config"]["temperature"], 0.4)
+        self.assertEqual(kwargs["json"]["generation_config"]["thinking_level"], "low")
+        self.assertEqual(kwargs["timeout"], (5, 45.0))
+        response.raise_for_status.assert_called_once()
+
+    def test_request_ai_market_summary_uses_custom_timeout(self) -> None:
+        response = Mock()
+        response.json.return_value = {"output_text": "自然な市況メモです。"}
+        requests = Mock()
+        requests.post.return_value = response
+
+        with patch.dict("sys.modules", {"requests": requests}):
+            request_ai_market_summary("prompt", "test-api-key", "test-model", 60)
+
+        _, kwargs = requests.post.call_args
+        self.assertEqual(kwargs["timeout"], (5, 60))
+
+    def test_generate_ai_market_summary_returns_none_without_api_key(self) -> None:
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("main.request_ai_market_summary") as request_ai_market_summary,
+        ):
+            summary = generate_ai_market_summary([])
+
+        self.assertIsNone(summary)
+        request_ai_market_summary.assert_not_called()
+
+    def test_generate_ai_market_summary_falls_back_on_error(self) -> None:
+        with (
+            patch("main.request_ai_market_summary", side_effect=RuntimeError("boom")),
+            patch("main.logging.warning") as log_warning,
+        ):
+            summary = generate_ai_market_summary([], api_key="test-api-key", model="test-model")
+
+        self.assertIsNone(summary)
+        log_warning.assert_called_once_with(
+            "AI要約の生成に失敗しました。ルールベースのサマリにフォールバックします。原因: %s",
+            "test-model: RuntimeError: boom",
+        )
+
+    def test_generate_ai_market_summary_tries_fallback_model_on_retryable_error(self) -> None:
+        response = Mock()
+        response.status_code = 500
+        response.text = '{"error":{"message":"high demand"}}'
+        exc = RuntimeError("Gemini API error")
+        exc.response = response
+
+        with (
+            patch.dict("os.environ", {"GEMINI_FALLBACK_MODELS": "fallback-model"}, clear=True),
+            patch("main.request_ai_market_summary", side_effect=[exc, "fallback summary"]) as request_summary,
+            patch("main.logging.warning") as log_warning,
+        ):
+            summary = generate_ai_market_summary([], api_key="test-api-key", model="primary-model")
+
+        self.assertEqual(summary, "fallback summary")
+        self.assertEqual(request_summary.call_args_list[0].args[2], "primary-model")
+        self.assertEqual(request_summary.call_args_list[1].args[2], "fallback-model")
+        log_warning.assert_called_once()
+        self.assertIn("別のGeminiモデルで再試行します", log_warning.call_args.args[0])
+
+    def test_generate_ai_market_summary_does_not_try_fallback_on_non_retryable_error(self) -> None:
+        response = Mock()
+        response.status_code = 400
+        response.text = '{"error":{"message":"bad request"}}'
+        exc = RuntimeError("Gemini API error")
+        exc.response = response
+
+        with (
+            patch.dict("os.environ", {"GEMINI_FALLBACK_MODELS": "fallback-model"}, clear=True),
+            patch("main.request_ai_market_summary", side_effect=exc) as request_summary,
+            patch("main.logging.warning") as log_warning,
+        ):
+            summary = generate_ai_market_summary([], api_key="test-api-key", model="primary-model")
+
+        self.assertIsNone(summary)
+        request_summary.assert_called_once()
+        log_warning.assert_called_once()
+        self.assertIn("ルールベースのサマリにフォールバックします", log_warning.call_args.args[0])
+
+    def test_formats_http_exception_summary(self) -> None:
+        response = Mock()
+        response.status_code = 400
+        response.text = '{\n  "error": {"message": "invalid api key"}\n}'
+        exc = RuntimeError("Gemini API error")
+        exc.response = response
+
+        self.assertEqual(
+            format_exception_summary(exc),
+            'RuntimeError: HTTPステータス: 400. Gemini API error レスポンス: { "error": {"message": "invalid api key"} }',
+        )
+
+    def test_parse_positive_float_returns_default_for_invalid_values(self) -> None:
+        self.assertEqual(parse_positive_float(None, 45), 45)
+        self.assertEqual(parse_positive_float("", 45), 45)
+        self.assertEqual(parse_positive_float("invalid", 45), 45)
+        self.assertEqual(parse_positive_float("0", 45), 45)
+        self.assertEqual(parse_positive_float("60", 45), 60)
+
+    def test_parse_model_list(self) -> None:
+        self.assertEqual(parse_model_list(None), ())
+        self.assertEqual(parse_model_list(" gemini-a, ,gemini-b "), ("gemini-a", "gemini-b"))
+
+    def test_build_gemini_model_candidates_deduplicates_models(self) -> None:
+        with patch.dict("os.environ", {"GEMINI_FALLBACK_MODELS": "fallback,primary"}, clear=True):
+            self.assertEqual(build_gemini_model_candidates("primary"), ("primary", "fallback"))
+
+    def test_should_try_next_gemini_model_for_retryable_status(self) -> None:
+        response = Mock()
+        response.status_code = 500
+        exc = RuntimeError("server error")
+        exc.response = response
+
+        self.assertTrue(should_try_next_gemini_model(exc))
+
+    def test_should_not_try_next_gemini_model_for_bad_request(self) -> None:
+        response = Mock()
+        response.status_code = 400
+        exc = RuntimeError("bad request")
+        exc.response = response
+
+        self.assertFalse(should_try_next_gemini_model(exc))
 
 
 if __name__ == "__main__":

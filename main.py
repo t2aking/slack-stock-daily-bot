@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -9,7 +10,15 @@ from typing import Iterable
 
 SLACK_WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
 STOCK_CONFIG_ENV = "STOCK_CONFIG_PATH"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_MODEL_ENV = "GEMINI_MODEL"
+GEMINI_FALLBACK_MODELS_ENV = "GEMINI_FALLBACK_MODELS"
+GEMINI_TIMEOUT_ENV = "GEMINI_TIMEOUT_SECONDS"
 DEFAULT_STOCK_CONFIG_PATH = "stocks.yml"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite")
+DEFAULT_GEMINI_TIMEOUT_SECONDS = 45.0
+GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
 
 @dataclass(frozen=True)
@@ -278,6 +287,274 @@ def generate_market_summary(
     return lines
 
 
+def build_market_data_for_ai(
+    quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG
+) -> str:
+    lines: list[str] = []
+    for section_title, symbols in config.sections():
+        lines.append(section_title)
+        for symbol in symbols:
+            quote = find_quote(quotes, symbol.symbol)
+            if quote is None or quote.failed:
+                lines.append(f"- {symbol.display_name}: 取得失敗")
+                continue
+            if quote.close is None or quote.change is None or quote.change_rate is None:
+                lines.append(f"- {symbol.display_name}: 取得失敗")
+                continue
+
+            lines.append(
+                f"- {symbol.display_name}: 前日終値 {format_number(quote.close)}, "
+                f"前日比 {format_change(quote.change)}, "
+                f"前日比率 {format_change_rate(quote.change_rate)}"
+            )
+
+    return "\n".join(lines)
+
+
+def build_ai_summary_prompt(
+    quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG
+) -> str:
+    rule_summary = "\n".join(generate_market_summary(quotes, config)[1:])
+    market_data = build_market_data_for_ai(quotes, config)
+    return "\n".join(
+        [
+            "以下の市場データをもとに、投資助言ではなく市況メモとして100〜150字で要約してください。",
+            "断定的な売買推奨は避けてください。",
+            "数値の分析メモを参考にしつつ、自然な日本語の1段落だけを返してください。",
+            "",
+            "市場データ:",
+            market_data,
+            "",
+            "数値分析メモ:",
+            rule_summary,
+        ]
+    )
+
+
+def extract_gemini_output_text(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    steps = data.get("steps")
+    if isinstance(steps, list):
+        step_text = extract_text_from_gemini_node(steps)
+        if step_text:
+            return step_text
+
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return ""
+
+    parts: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        content_parts = content.get("parts")
+        if not isinstance(content_parts, list):
+            continue
+        for content_part in content_parts:
+            if not isinstance(content_part, dict):
+                continue
+            text = content_part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+
+    return "".join(parts).strip()
+
+
+def extract_text_from_gemini_node(node: object) -> str:
+    parts: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+
+        if not isinstance(value, dict):
+            return
+
+        for key in ("output_text", "text"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+
+        for key in ("content", "parts", "output", "outputs", "response", "result", "message", "messages", "steps"):
+            child = value.get(key)
+            if child is not None:
+                collect(child)
+
+    collect(node)
+    return "".join(parts).strip()
+
+
+def summarize_response_data(data: object) -> str:
+    if not isinstance(data, dict):
+        return f"レスポンス型: {type(data).__name__}"
+
+    keys = ", ".join(str(key) for key in data.keys()) or "なし"
+    try:
+        snippet = json.dumps(data, ensure_ascii=False, separators=(",", ":"))[:300]
+    except (TypeError, ValueError):
+        snippet = "<JSON化できません>"
+
+    return f"レスポンスキー: {keys}. レスポンス抜粋: {snippet}"
+
+
+def parse_positive_float(value: str | None, default: float) -> float:
+    if value is None or not value.strip():
+        return default
+
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+
+    return parsed if parsed > 0 else default
+
+
+def parse_model_list(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    return tuple(model for item in value.split(",") if (model := item.strip()))
+
+
+def build_gemini_model_candidates(primary_model: str) -> tuple[str, ...]:
+    fallback_models = parse_model_list(os.environ.get(GEMINI_FALLBACK_MODELS_ENV))
+    if not fallback_models:
+        fallback_models = DEFAULT_GEMINI_FALLBACK_MODELS
+
+    candidates: list[str] = []
+    for model in (primary_model, *fallback_models):
+        if model and model not in candidates:
+            candidates.append(model)
+
+    return tuple(candidates)
+
+
+def format_exception_summary(exc: Exception) -> str:
+    detail = str(exc).strip()
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    response_text = getattr(response, "text", "")
+    if isinstance(response_text, str) and response_text.strip():
+        single_line_text = " ".join(response_text.split())
+        detail = (
+            f"{detail} レスポンス: {single_line_text[:300]}"
+            if detail
+            else f"レスポンス: {single_line_text[:300]}"
+        )
+
+    if status_code is not None:
+        detail = f"HTTPステータス: {status_code}. {detail}" if detail else f"HTTPステータス: {status_code}."
+
+    if not detail:
+        detail = "詳細なし"
+
+    return f"{type(exc).__name__}: {detail}"
+
+
+def should_try_next_gemini_model(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in {429, 500, 502, 503, 504}:
+        return True
+
+    return type(exc).__name__ in {"ConnectionError", "ReadTimeout", "Timeout"}
+
+
+def request_ai_market_summary(
+    prompt: str,
+    api_key: str,
+    model: str = DEFAULT_GEMINI_MODEL,
+    timeout_seconds: float = DEFAULT_GEMINI_TIMEOUT_SECONDS,
+) -> str:
+    try:
+        import requests
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "requests がインストールされていません。`uv pip install -r requirements.txt` または `pip install -r requirements.txt` を実行してください。"
+        ) from None
+
+    response = requests.post(
+        GEMINI_INTERACTIONS_URL,
+        headers={
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "input": prompt,
+            "generation_config": {
+                "temperature": 0.4,
+                "thinking_level": "low",
+            },
+        },
+        timeout=(5, timeout_seconds),
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    summary = extract_gemini_output_text(data)
+    if not summary:
+        raise RuntimeError(
+            f"Gemini APIのレスポンスから要約本文を取得できませんでした。{summarize_response_data(data)}"
+        )
+
+    return summary
+
+
+def generate_ai_market_summary(
+    quotes: list[MarketQuote],
+    config: MarketConfig = DEFAULT_MARKET_CONFIG,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> str | None:
+    gemini_api_key = (api_key if api_key is not None else os.environ.get(GEMINI_API_KEY_ENV, "")).strip()
+    if not gemini_api_key:
+        return None
+
+    gemini_model = (model if model is not None else os.environ.get(GEMINI_MODEL_ENV, DEFAULT_GEMINI_MODEL)).strip()
+    if not gemini_model:
+        gemini_model = DEFAULT_GEMINI_MODEL
+    timeout_seconds = parse_positive_float(
+        os.environ.get(GEMINI_TIMEOUT_ENV), DEFAULT_GEMINI_TIMEOUT_SECONDS
+    )
+
+    prompt = build_ai_summary_prompt(quotes, config)
+    failures: list[str] = []
+    model_candidates = build_gemini_model_candidates(gemini_model)
+    for index, candidate_model in enumerate(model_candidates):
+        try:
+            return request_ai_market_summary(prompt, gemini_api_key, candidate_model, timeout_seconds)
+        except Exception as exc:
+            summary = f"{candidate_model}: {format_exception_summary(exc)}"
+            failures.append(summary)
+            has_next_model = index < len(model_candidates) - 1
+            if has_next_model and should_try_next_gemini_model(exc):
+                logging.warning(
+                    "AI要約の生成に失敗しました。別のGeminiモデルで再試行します。原因: %s",
+                    summary,
+                )
+                continue
+
+            logging.warning(
+                "AI要約の生成に失敗しました。ルールベースのサマリにフォールバックします。原因: %s",
+                " / ".join(failures),
+            )
+            return None
+
+    return None
+
+
 def fetch_market_quote(symbol: str, name: str | None = None) -> MarketQuote:
     try:
         import yfinance as yf
@@ -343,7 +620,20 @@ def build_alert_lines(quotes: list[MarketQuote], config: MarketConfig) -> list[s
     ]
 
 
-def build_message(quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG) -> str:
+def append_summary_lines(
+    lines: list[str], quotes: list[MarketQuote], config: MarketConfig, ai_summary: str | None
+) -> None:
+    if ai_summary:
+        lines.extend(["値動きサマリ", ai_summary])
+    else:
+        lines.extend(generate_market_summary(quotes, config))
+
+
+def build_message(
+    quotes: list[MarketQuote],
+    config: MarketConfig = DEFAULT_MARKET_CONFIG,
+    ai_summary: str | None = None,
+) -> str:
     lines = ["株式市況"]
     alert_lines = build_alert_lines(quotes, config)
     if alert_lines:
@@ -359,12 +649,14 @@ def build_message(quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARK
         append_quote_section(lines, title, section_quotes)
 
     lines.append("")
-    lines.extend(generate_market_summary(quotes, config))
+    append_summary_lines(lines, quotes, config, ai_summary)
     return "\n".join(lines)
 
 
 def build_blocks(
-    quotes: list[MarketQuote], config: MarketConfig = DEFAULT_MARKET_CONFIG
+    quotes: list[MarketQuote],
+    config: MarketConfig = DEFAULT_MARKET_CONFIG,
+    ai_summary: str | None = None,
 ) -> list[dict[str, object]]:
     alert_lines = build_alert_lines(quotes, config)
     blocks: list[dict[str, object]] = [
@@ -401,7 +693,9 @@ def build_blocks(
             }
         )
 
-    summary_lines = generate_market_summary(quotes, config)
+    summary_lines = (
+        ["値動きサマリ", ai_summary] if ai_summary else generate_market_summary(quotes, config)
+    )
     blocks.extend(
         [
             {"type": "divider"},
@@ -420,7 +714,11 @@ def build_blocks(
 def build_payload() -> dict[str, object]:
     config = load_market_config()
     quotes = fetch_market_quotes(config.all_symbols())
-    return {"text": build_message(quotes, config), "blocks": build_blocks(quotes, config)}
+    ai_summary = generate_ai_market_summary(quotes, config)
+    return {
+        "text": build_message(quotes, config, ai_summary),
+        "blocks": build_blocks(quotes, config, ai_summary),
+    }
 
 
 def post_to_slack(webhook_url: str) -> None:

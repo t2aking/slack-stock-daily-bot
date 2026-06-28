@@ -73,6 +73,23 @@ STOCK_CONFIG_PATH=stocks.yml
 
 `symbol` は yfinance で取得できるティッカー、`name` はSlack表示用の名称です。`name` と `symbol` が異なる場合は `日経平均 (^N225)` のように表示されます。
 
+## AI要約の設定
+
+`GEMINI_API_KEY` を設定すると、値動きサマリをGemini APIで100〜150字程度の自然な市況メモに整形します。
+数値分析はBot内のルールベース処理で行い、AIには文章化だけを任せます。
+
+```env
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-3.5-flash
+GEMINI_FALLBACK_MODELS=gemini-3.1-flash-lite,gemini-2.5-flash-lite
+GEMINI_TIMEOUT_SECONDS=45
+```
+
+`GEMINI_API_KEY` が未設定の場合、またはAI要約の生成に失敗した場合は、従来のルールベースの箇条書きサマリを投稿します。
+AI要約は投資助言ではなく市況メモとして生成するようプロンプトで制御していますが、投稿前に実運用に合う表現か確認してください。
+Gemini APIの応答待ちは標準で45秒です。変更する場合は `GEMINI_TIMEOUT_SECONDS` を指定してください。
+Gemini APIが混雑している場合は、`GEMINI_FALLBACK_MODELS` のモデルを左から順に試します。
+
 ## 投稿
 
 ```bash
@@ -110,6 +127,13 @@ uv run python main.py
 - 投資助言ではなく、市況メモとしての整理です。
 ```
 
+`GEMINI_API_KEY` を設定している場合、値動きサマリは以下のような1段落の文章になります。
+
+```text
+値動きサマリ
+米国株は主要指数やETFが堅調に推移し、NASDAQ系も相対的に強さが見られます。USD/JPYも上昇しており、外部環境と為替は日本株の支えになりやすい市況です。
+```
+
 初期設定の対象銘柄は `^N225`, `^GSPC`, `VOO`, `VTI`, `QQQ`, `USDJPY=X` です。
 上昇は `🟢`、下落は `🔴`、横ばいは `⚪` で表示します。
 個別銘柄の取得に失敗した場合でも処理は止めず、該当行に `⚠️ 取得失敗` と表示します。
@@ -120,11 +144,21 @@ uv run python main.py
 GitHub Actionsで、火曜〜土曜の朝9時（JST）に自動投稿します。
 GitHub ActionsのcronはUTC基準のため、設定は `0 0 * * 2-6` です。
 
-リポジトリの `Settings` → `Secrets and variables` → `Actions` に、以下のRepository secretを登録してください。
+public repositoryで秘密情報を扱うため、`.github/workflows/daily-stock.yml` は `stock-post` environmentを使います。
+リポジトリの `Settings` → `Environments` → `stock-post` に、以下のEnvironment secretを登録してください。
 
 ```text
 SLACK_WEBHOOK_URL
+GEMINI_API_KEY
 ```
+
+`GEMINI_API_KEY` はAI要約を使う場合だけ必要です。必要に応じて `Settings` → `Secrets and variables` → `Actions` のRepository variable `GEMINI_MODEL` でモデル名を変更できます。
+`GEMINI_MODEL` が未設定の場合は `gemini-3.5-flash` を使います。
+混雑時の退避先を変える場合はRepository variable `GEMINI_FALLBACK_MODELS` にカンマ区切りで指定してください。
+Gemini APIのタイムアウトを変える場合はRepository variable `GEMINI_TIMEOUT_SECONDS` を指定してください。
+
+workflowは最小権限として `permissions: contents: read` を指定しています。
+GitHub側ではActionsのWorkflow permissionsをRead onlyにし、fork pull request workflowは外部コントリビューターの承認を必須にしてください。
 
 `.github/workflows/daily-stock.yml` は `workflow_dispatch` にも対応しているため、GitHub Actions画面から手動実行もできます。
 
@@ -132,9 +166,11 @@ SLACK_WEBHOOK_URL
 
 `SLACK_WEBHOOK_URL` が未設定の場合、銘柄設定ファイルが不正な場合、依存ライブラリが未インストールの場合、Slackへの投稿に失敗した場合は、標準エラーに原因がわかるメッセージを表示して終了します。
 株価取得中に例外が発生した場合は、該当銘柄を `⚠️ 取得失敗` として扱い、例外ログを標準エラーへ出力します。
+AI要約の生成に失敗した場合は標準エラーに警告ログを出力し、Slack投稿自体はルールベースのサマリで継続します。
 
 ## 秘密情報の扱い
 
 - `SLACK_WEBHOOK_URL` は `.env` に設定してください。
+- `GEMINI_API_KEY` を使う場合も `.env` または実行環境の秘密情報として設定してください。
 - `.env` など秘密情報を含むファイルはコミットしないでください。
 - 本番やCIでは、実行環境の環境変数として `SLACK_WEBHOOK_URL` を設定しても動作します。
