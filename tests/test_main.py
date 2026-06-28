@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from main import (
     DEFAULT_MARKET_CONFIG,
@@ -9,6 +9,7 @@ from main import (
     build_blocks,
     build_message,
     build_payload,
+    fetch_market_quote,
     generate_market_summary,
     parse_market_config,
 )
@@ -154,6 +155,35 @@ class BuildMessageTest(unittest.TestCase):
         self.assertIn("text", payload)
         self.assertIn("🟢 ^N225", payload["text"])
         self.assertIn("🟢 ^N225", payload["blocks"][1]["text"]["text"])
+
+    def test_builds_all_failed_alert_payload(self) -> None:
+        quotes = [
+            MarketQuote(symbol=symbol.symbol, name=symbol.name, failed=True)
+            for symbol in DEFAULT_MARKET_CONFIG.all_symbols()
+        ]
+
+        message = build_message(quotes)
+        blocks = build_blocks(quotes)
+
+        self.assertIn("⚠️ 全銘柄の株価取得に失敗しました。", message)
+        self.assertIn("yfinanceまたはネットワークの状態を確認してください。", message)
+        self.assertEqual(blocks[0]["text"]["text"], "株式市況取得エラー")
+        self.assertIn("⚠️ 全銘柄の株価取得に失敗しました。", blocks[1]["text"]["text"])
+
+    def test_fetch_market_quote_logs_unexpected_exception(self) -> None:
+        yfinance = Mock()
+        yfinance.Ticker.return_value.history.side_effect = RuntimeError("boom")
+
+        with (
+            patch.dict("sys.modules", {"yfinance": yfinance}),
+            patch("main.logging.exception") as log_exception,
+        ):
+            quote = fetch_market_quote("^N225", "日経平均")
+
+        self.assertTrue(quote.failed)
+        self.assertEqual(quote.symbol, "^N225")
+        self.assertEqual(quote.name, "日経平均")
+        log_exception.assert_called_once_with("株価取得に失敗しました: %s", "^N225")
 
     def test_generates_weak_market_summary(self) -> None:
         summary = generate_market_summary(
